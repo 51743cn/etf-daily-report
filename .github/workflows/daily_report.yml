@@ -1,0 +1,38 @@
+name: ETF每日收盘分析报告
+
+on:
+  # 每个工作日 北京时间 15:35 运行（UTC 07:35）
+  schedule:
+    - cron: '35 7 * * 1-5'
+
+  # 允许手动触发（随时测试）
+  workflow_dispatch:
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 2. 安装 Python
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. 安装依赖
+      - name: 安装依赖包
+        run: pip install -r requirements.txt
+
+      # 4. 运行分析脚本（从 GitHub Secrets 读取邮箱配置）
+      - name: 运行每日分析并发送报告
+        env:
+          GMAIL_SENDER:   ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          GMAIL_RECEIVER: ${{ secrets.GMAIL_RECEIVER }}
+        run: python daily_analysis.py
