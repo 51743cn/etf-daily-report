@@ -1,12 +1,14 @@
 """
 每日 ETF 分析脚本 — 159140 & 513050
 收盘后自动运行，生成分析图表+文字解读，发送 Gmail 报告
+新增：A股宏观热点板块（前3行业 + 每行业前3标的 + 持续热点追踪）
 """
 
 import os
 import smtplib
 import datetime
 import io
+import json
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -30,8 +32,197 @@ TICKERS = {
     '159140.SZ': '159140 科创AI ETF',
     '513050.SS': '513050 中概互联ETF',
 }
+
+# ─── A股行业代表性标的（行业名 → [(ticker, 显示名称), ...]）────────
+SECTOR_UNIVERSE = {
+    '半导体/芯片':    [('512480.SS','半导体ETF'), ('159995.SZ','芯片ETF'),    ('688981.SS','中芯国际')],
+    'AI/科技通信':   [('515880.SS','通信ETF'),   ('159509.SZ','AI算力ETF'),  ('300059.SZ','东方财富')],
+    '新能源/电动车': [('515700.SS','新能源车ETF'),('516160.SS','新能源ETF'),  ('300750.SZ','宁德时代')],
+    '军工/航天':     [('512660.SS','军工ETF'),   ('600760.SS','中航沈飞'),   ('600346.SS','中国卫星')],
+    '医药/医疗':     [('159929.SZ','医药ETF'),   ('159869.SZ','医疗ETF'),    ('600276.SS','恒瑞医药')],
+    '大消费/白酒':   [('512690.SS','酒ETF'),     ('159928.SZ','消费ETF'),    ('600519.SS','贵州茅台')],
+    '券商/金融':     [('512880.SS','证券ETF'),   ('510050.SS','上证50ETF'),  ('601318.SS','中国平安')],
+    '煤炭/能源':     [('515220.SS','煤炭ETF'),   ('601088.SS','中国神华'),   ('601985.SS','中国核电')],
+    '有色金属':      [('512400.SS','有色金属ETF'),('601899.SS','紫金矿业'),  ('600362.SS','江西铜业')],
+    '房地产':        [('512200.SS','地产ETF'),   ('600048.SS','保利发展'),   ('001979.SZ','招商蛇口')],
+}
+
+# 热点历史缓存文件（记录近7天每日前3行业）
+HOTSPOT_CACHE = os.path.join(os.path.dirname(__file__), 'hotspot_history.json')
+
 # ─────────────────────────────────────────────────────────────
 
+
+# ─── A股宏观热点模块 ──────────────────────────────────────────
+
+def fetch_sector_performance():
+    """
+    获取各行业今日涨跌幅，返回行业级涨幅排名。
+    每个行业取所含标的涨幅均值作为行业热度。
+    """
+    sector_results = {}
+    for sector, stocks in SECTOR_UNIVERSE.items():
+        changes = []
+        stock_data = []
+        for ticker, name in stocks:
+            try:
+                hist = yf.Ticker(ticker).history(period='5d')
+                if len(hist) >= 2:
+                    close = round(hist['Close'].iloc[-1], 3)
+                    chg = round((hist['Close'].iloc[-1] / hist['Close'].iloc[-2] - 1) * 100, 2)
+                    vol_ratio = round(
+                        hist['Volume'].iloc[-1] / hist['Volume'].iloc[-5:].mean(), 2
+                    ) if len(hist) >= 5 else 1.0
+                    changes.append(chg)
+                    stock_data.append({
+                        'ticker': ticker, 'name': name,
+                        'close': close, 'change': chg, 'vol_ratio': vol_ratio
+                    })
+            except Exception:
+                pass
+        if stock_data:
+            # 按涨幅排序，取前3
+            stock_data.sort(key=lambda x: x['change'], reverse=True)
+            sector_avg = round(sum(changes) / len(changes), 2) if changes else 0
+            sector_results[sector] = {
+                'avg_change': sector_avg,
+                'stocks': stock_data[:3]
+            }
+    # 按行业平均涨幅排序
+    ranked = sorted(sector_results.items(), key=lambda x: x[1]['avg_change'], reverse=True)
+    return ranked
+
+
+def load_hotspot_history():
+    """读取热点历史（最近7天）"""
+    if os.path.exists(HOTSPOT_CACHE):
+        try:
+            with open(HOTSPOT_CACHE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_hotspot_history(history, today_sectors):
+    """保存今日前3行业到历史缓存，保留最近7天"""
+    today = datetime.date.today().isoformat()
+    history[today] = [s[0] for s in today_sectors[:3]]
+    # 只保留最近7天
+    cutoff = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+    history = {d: v for d, v in history.items() if d >= cutoff}
+    try:
+        with open(HOTSPOT_CACHE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return history
+
+
+def detect_persistent_hotspots(history, today_sectors):
+    """
+    检测近5个交易日连续出现在热点前3的行业。
+    返回 {sector_name: days_count} 仅包含连续≥2天的行业。
+    """
+    today = datetime.date.today().isoformat()
+    # 取除今天外最近5天记录
+    past_days = sorted([d for d in history.keys() if d < today], reverse=True)[:5]
+    today_top3 = [s[0] for s in today_sectors[:3]]
+
+    persistent = {}
+    for sector in today_top3:
+        count = 1  # 包含今天
+        for d in past_days:
+            if sector in history.get(d, []):
+                count += 1
+            else:
+                break  # 不连续则停止计数
+        if count >= 2:
+            persistent[sector] = count
+    return persistent
+
+
+def build_hotspot_html(ranked_sectors, persistent):
+    """生成热点板块HTML片段"""
+    today = datetime.date.today().strftime('%Y年%m月%d日')
+    top3 = ranked_sectors[:3]
+
+    # 行业卡片
+    sector_cards = ''
+    for rank, (sector_name, data) in enumerate(top3, 1):
+        avg_chg = data['avg_change']
+        chg_color = '#06d6a0' if avg_chg >= 0 else '#ff6b6b'
+        sign = '+' if avg_chg >= 0 else ''
+
+        # 持续热点标签
+        persist_badge = ''
+        if sector_name in persistent:
+            days = persistent[sector_name]
+            persist_badge = f'<span style="background:#ff9800;color:#000;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:bold;margin-left:8px;">🔥 连续{days}日热点</span>'
+
+        # 股票行
+        stock_rows = ''
+        for i, stk in enumerate(data['stocks'], 1):
+            sc = '#06d6a0' if stk['change'] >= 0 else '#ff6b6b'
+            ss = '+' if stk['change'] >= 0 else ''
+            vol_tip = ''
+            if stk['vol_ratio'] > 1.5:
+                vol_tip = f'<span style="color:#ffd166;font-size:11px;"> 量比{stk["vol_ratio"]}x↑</span>'
+            elif stk['vol_ratio'] < 0.7:
+                vol_tip = f'<span style="color:#8b949e;font-size:11px;"> 缩量{stk["vol_ratio"]}x</span>'
+            stock_rows += f'''
+            <tr>
+              <td style="padding:5px 8px;color:#8b949e;font-size:11px;">#{i}</td>
+              <td style="padding:5px 8px;color:#e6edf3;font-size:12px;">{stk["name"]}</td>
+              <td style="padding:5px 8px;color:#8b949e;font-size:11px;">{stk["ticker"]}</td>
+              <td style="padding:5px 8px;font-size:13px;font-weight:bold;color:#ffd166;">{stk["close"]}</td>
+              <td style="padding:5px 8px;font-size:13px;font-weight:bold;color:{sc};">{ss}{stk["change"]}%{vol_tip}</td>
+            </tr>'''
+
+        sector_cards += f'''
+        <div style="background:#161b22;border-radius:10px;padding:16px;margin-bottom:12px;border:1px solid #30363d;border-left:3px solid {chg_color};">
+          <div style="display:flex;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:6px;">
+            <span style="background:#21262d;color:#8b949e;border-radius:4px;padding:3px 8px;font-size:12px;">#{rank}</span>
+            <span style="font-size:15px;font-weight:bold;color:#e6edf3;margin-left:6px;">{sector_name}</span>
+            <span style="font-size:14px;font-weight:bold;color:{chg_color};margin-left:auto;">{sign}{avg_chg}% 均涨幅</span>
+            {persist_badge}
+          </div>
+          <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;min-width:320px;">
+            <thead><tr style="background:#21262d;">
+              <th style="padding:5px 8px;text-align:left;color:#8b949e;font-size:11px;font-weight:normal;">排名</th>
+              <th style="padding:5px 8px;text-align:left;color:#8b949e;font-size:11px;font-weight:normal;">名称</th>
+              <th style="padding:5px 8px;text-align:left;color:#8b949e;font-size:11px;font-weight:normal;">代码</th>
+              <th style="padding:5px 8px;text-align:left;color:#8b949e;font-size:11px;font-weight:normal;">收盘价</th>
+              <th style="padding:5px 8px;text-align:left;color:#8b949e;font-size:11px;font-weight:normal;">涨跌幅</th>
+            </tr></thead>
+            <tbody>{stock_rows}</tbody>
+          </table>
+          </div>
+        </div>'''
+
+    # 持续热点提示（如有不在今天top3但在历史中持续的情形，目前只追踪当日top3）
+    persist_summary = ''
+    if persistent:
+        ps_items = ', '.join([f'{s}（{d}日）' for s, d in persistent.items()])
+        persist_summary = f'''
+        <div style="background:#2d1f00;border-radius:8px;padding:12px 16px;margin-top:4px;border:1px solid #ff9800;">
+          <p style="margin:0;font-size:13px;color:#ffd166;">
+            🔥 <strong>持续热点提醒</strong>：{ps_items} 已连续多日出现在热门板块，需关注趋势延续或退潮风险。
+          </p>
+        </div>'''
+
+    return f'''
+  <!-- A股宏观热点 -->
+  <div style="background:#161b22;border-radius:10px;padding:20px;margin-bottom:20px;border:1px solid #30363d;">
+    <h2 style="margin:0 0 4px;font-size:16px;color:#e6edf3;">🌡️ A股市场今日热点板块（前3）</h2>
+    <p style="margin:0 0 14px;color:#8b949e;font-size:12px;">基于各行业代表ETF&个股涨幅排名 · {today}</p>
+    {sector_cards}
+    {persist_summary}
+  </div>'''
+
+
+# ─── ETF数据获取 ──────────────────────────────────────────────
 
 def fetch_data(ticker, period='6mo'):
     hist = yf.Ticker(ticker).history(period=period)
@@ -396,7 +587,7 @@ def make_compare_chart(data_1y):
 
 # ─── 邮件HTML构建 ─────────────────────────────────────────────
 
-def build_html_email(signals, corr):
+def build_html_email(signals, corr, hotspot_html=''):
     today = datetime.date.today().strftime('%Y年%m月%d日')
     wd = ['周一','周二','周三','周四','周五','周六','周日'][datetime.date.today().weekday()]
 
@@ -512,6 +703,8 @@ def build_html_email(signals, corr):
     <p style="margin:4px 0 0;color:#8b949e;font-size:13px;">标的：159140 科创AI ETF · 513050 中概互联ETF</p>
   </div>
 
+  {hotspot_html}
+
   <!-- 信号汇总表 -->
   <div style="background:#161b22;border-radius:10px;padding:16px;margin-bottom:20px;border:1px solid #30363d;">
     <h2 style="margin:0 0 12px;font-size:16px;color:#e6edf3;">📋 今日信号速览</h2>
@@ -600,14 +793,30 @@ def main():
     signals = [signal_summary(all_ta[t], t, TICKERS[t]) for t in tickers]
     for s in signals:
         print(f"  {s['label']}: {s['close']} ({s['change']}) | RSI={s['rsi']} | {s['macd_status']}")
+
+    print("🌡️ 获取A股宏观热点数据...")
+    try:
+        ranked_sectors = fetch_sector_performance()
+        hotspot_history = load_hotspot_history()
+        persistent = detect_persistent_hotspots(hotspot_history, ranked_sectors)
+        hotspot_history = save_hotspot_history(hotspot_history, ranked_sectors)
+        hotspot_html = build_hotspot_html(ranked_sectors, persistent)
+        print(f"  热点前3: {[s[0] for s in ranked_sectors[:3]]}")
+        if persistent:
+            print(f"  持续热点: {persistent}")
+    except Exception as e:
+        print(f"  ⚠️ 热点数据获取失败: {e}，跳过热点模块")
+        hotspot_html = ''
+
     print("🎨 生成图表...")
     ta_img_bytes = make_ta_chart(all_ta)
     compare_img_bytes, corr = make_compare_chart(data_1y)
     print("📧 构建邮件并发送...")
-    html = build_html_email(signals, corr)
+    html = build_html_email(signals, corr, hotspot_html=hotspot_html)
     send_email(html, ta_img_bytes, compare_img_bytes)
     print("✅ 完成！")
 
 
 if __name__ == '__main__':
     main()
+    
